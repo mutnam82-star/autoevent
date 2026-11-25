@@ -3,8 +3,11 @@ import re
 import json
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from playwright.sync_api import sync_playwright
+
+# 한국 표준시(KST) 설정
+KST = timezone(timedelta(hours=9))
 
 # 환경변수 로드
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
@@ -13,6 +16,7 @@ NAVER_CLIENT_ID = os.environ.get("NAVER_CLIENT_ID")
 NAVER_CLIENT_SECRET = os.environ.get("NAVER_CLIENT_SECRET")
 
 HISTORY_FILE = "sent_history.json"
+EVENTS_DATA_FILE = "events_data.json"
 
 # 키워드 필터 설정
 SURVEY_KEYWORDS = ["설문", "만족도", "의견수렴", "투표", "퀴즈", "이벤트"]
@@ -32,6 +36,22 @@ def load_history():
 def save_history(history):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history[-1000:], f, ensure_ascii=False, indent=2)
+
+def update_events_json(new_events):
+    """웹 대시보드(index.html)용 events_data.json 업데이트"""
+    existing = []
+    if os.path.exists(EVENTS_DATA_FILE):
+        with open(EVENTS_DATA_FILE, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
+    for ev in new_events:
+        ev["date"] = today_str
+
+    # 신규 이벤트를 최상단에 추가하고 최근 300개 유지
+    merged = new_events + existing
+    with open(EVENTS_DATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(merged[:300], f, ensure_ascii=False, indent=2)
 
 def is_valid_event(text, require_public=False):
     if any(ex in text for ex in EXCLUDE_KEYWORDS):
@@ -176,9 +196,9 @@ def send_telegram_messages(new_events):
         print("신규 이벤트 없음")
         return
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(KST).strftime("%Y-%m-%d")
     header = f"☕ <b>[{today_str}] 공공기관·커피 설문 이벤트 ({len(new_events)}건)</b>\n\n"
-    
+
     chunks = []
     current_msg = header
     for idx, ev in enumerate(new_events, 1):
@@ -215,6 +235,7 @@ def main():
             history.append(ev["id"])
 
     send_telegram_messages(new_events)
+    update_events_json(new_events)
     save_history(history)
 
 if __name__ == "__main__":
