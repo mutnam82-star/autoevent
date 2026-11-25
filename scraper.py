@@ -1,18 +1,27 @@
 import os
+import re
 import json
 import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
+from playwright.sync_api import sync_playwright
 
-# 환경변수에서 텔레그램 정보 로드
+# 환경변수 로드
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+NAVER_CLIENT_ID = os.environ.get("NAVER_CLIENT_ID")
+NAVER_CLIENT_SECRET = os.environ.get("NAVER_CLIENT_SECRET")
 
 HISTORY_FILE = "sent_history.json"
 
-# 필터링할 핵심 키워드 (제목에 하나라도 포함되면 추출)
-TARGET_KEYWORDS = ["설문", "만족도", "이벤트", "의견수렴", "퀴즈"]
-REWARD_KEYWORDS = ["커피", "아메리카노", "스타벅스", "기프티콘", "상품권", "쿠폰", "추첨", "경품"]
+# 키워드 필터 설정
+SURVEY_KEYWORDS = ["설문", "만족도", "의견수렴", "투표", "퀴즈", "이벤트"]
+REWARD_KEYWORDS = ["커피", "아메리카노", "스타벅스", "기프티콘", "모바일상품권", "상품권", "쿠폰", "추첨", "경품", "음료"]
+PUBLIC_KEYWORDS = ["구청", "시청", "군청", "도청", "공사", "공단", "진흥원", "연구원", "교육청", "보건소", "센터", "재단", "협회", "정부", "지자체", "공공"]
+EXCLUDE_KEYWORDS = ["마감", "종료", "당첨자 발표", "당첨자발표", "후기", "리뷰"]
+
+def clean_html(text):
+    return re.sub(r"<[^>]+>", "", text).replace("&quot;", '"').replace("&amp;", "&").strip()
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -21,47 +30,119 @@ def load_history():
     return []
 
 def save_history(history):
-    # 최근 500개 기록만 유지하여 파일 크기 관리
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history[-500:], f, ensure_ascii=False, indent=2)
+        json.dump(history[-1000:], f, ensure_ascii=False, indent=2)
 
-def is_target_event(title):
-    has_target = any(k in title for k in TARGET_KEYWORDS)
-    has_reward = any(k in title for k in REWARD_KEYWORDS)
-    # 설문/이벤트 성격이면서 경품 키워드가 있거나, 공공기관 설문인 경우
-    return has_target and has_reward
+def is_valid_event(text, require_public=False):
+    if any(ex in text for ex in EXCLUDE_KEYWORDS):
+        return False
+    has_survey = any(k in text for k in SURVEY_KEYWORDS)
+    has_reward = any(k in text for k in REWARD_KEYWORDS)
+    if require_public:
+        has_public = any(k in text for k in PUBLIC_KEYWORDS)
+        return has_survey and has_reward and has_public
+    return has_survey and has_reward
 
-def fetch_epeople_surveys():
-    """국민생각함(설문/이벤트) 수집"""
+# 1. 네이버 검색 API (블로그 + 웹문서: 전국 지자체·공기업 싹쓸이)
+def fetch_naver_api():
+    if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
+        print("네이버 API 키가 설정되지 않았습니다.")
+        return []
+
     events = []
-    url = "https://www.epeople.go.kr/nep/thnk/thnkList.npaid"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res = requests.get(url, headers=headers, timeout=10)
-        soup = BeautifulSoup(res.text, "html.parser")
-        # 게시판 목록 파싱 (사이트 구조 변경 시 선택자 수정 필요)
-        items = soup.select(".board_list tbody tr")
-        for item in items:
-            title_el = item.select_one("td.title a")
-            if not title_el:
-                continue
-            title = title_el.get_text(strip=True)
-            href = title_el.get("href", "")
-            link = f"https://www.epeople.go.kr{href}" if href.startswith("/") else href
-            
-            if "설문" in title or is_target_event(title):
-                events.append({
-                    "id": f"epeople_{title[:20]}",
-                    "source": "국민생각함",
-                    "title": title,
-                    "link": link
-                })
-    except Exception as e:
-        print(f"국민생각함 수집 오류: {e}")
+    headers = {
+        "X-Naver-Client-Id": NAVER_CLIENT_ID,
+        "X-Naver-Client-Secret": NAVER_CLIENT_SECRET
+    }
+    queries = [
+        "공공기관 설문조사 커피",
+        "만족도 조사 아메리카노 기프티콘",
+        "지자체 설문 이벤트 스타벅스",
+        "공단 설문조사 추첨 쿠폰"
+    ]
+    endpoints = [
+        ("네이버블로그", "https://openapi.naver.com/v1/search/blog.json"),
+        ("네이버웹", "https://openapi.naver.com/v1/search/webkr.json")
+    ]
+
+    for source_name, url in endpoints:
+        for q in queries:
+            params = {"query": q, "display": 15, "sort": "date"}
+            try:
+                res = requests.get(url, headers=headers, params=params, timeout=10)
+                if res.status_code != 200:
+                    continue
+                for item in res.json().get("items", []):
+                    title = clean_html(item.get("title", ""))
+                    desc = clean_html(item.get("description", ""))
+                    link = item.get("link", "")
+                    combined = f"{title} {desc}"
+
+                    if is_valid_event(combined, require_public=True):
+                        events.append({
+                            "id": f"naver_{link}",
+                            "source": source_name,
+                            "title": title,
+                            "link": link
+                        })
+            except Exception as e:
+                print(f"네이버 API({source_name}, {q}) 오류: {e}")
     return events
 
-def fetch_community_events():
-    """뽐뿌 이벤트/쿠폰 게시판 등 추가 타겟 수집 예시"""
+# 2. 국민생각함 & 소통24 (Playwright 동적 렌더링 수집)
+def fetch_public_portals():
+    events = []
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page(user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+
+        # ① 국민생각함 (진행중인 설문)
+        try:
+            page.goto("https://www.epeople.go.kr/nep/thnk/thnkList.npaid", timeout=20000)
+            page.wait_for_timeout(2000)
+            links = page.locator("a").all()
+            for el in links:
+                title = (el.inner_text() or "").strip()
+                href = el.get_attribute("href") or ""
+                if len(title) >= 8 and ("설문" in title or "만족도" in title or "이벤트" in title):
+                    if any(ex in title for ex in EXCLUDE_KEYWORDS):
+                        continue
+                    full_link = f"https://www.epeople.go.kr{href}" if href.startswith("/") else "https://www.epeople.go.kr/nep/thnk/thnkList.npaid"
+                    events.append({
+                        "id": f"epeople_{title[:25]}",
+                        "source": "국민생각함",
+                        "title": title,
+                        "link": full_link
+                    })
+        except Exception as e:
+            print(f"국민생각함 수집 오류: {e}")
+
+        # ② 소통24 (정책참여/설문)
+        try:
+            page.goto("https://sotong.go.kr/front/propse/propseList.do", timeout=20000)
+            page.wait_for_timeout(2500)
+            links = page.locator("a").all()
+            for el in links:
+                title = (el.inner_text() or "").strip()
+                href = el.get_attribute("href") or ""
+                if len(title) >= 8 and any(k in title for k in SURVEY_KEYWORDS):
+                    if any(ex in title for ex in EXCLUDE_KEYWORDS):
+                        continue
+                    full_link = f"https://sotong.go.kr{href}" if href.startswith("/") else "https://sotong.go.kr/front/propse/propseList.do"
+                    events.append({
+                        "id": f"sotong_{title[:25]}",
+                        "source": "소통24",
+                        "title": title,
+                        "link": full_link
+                    })
+        except Exception as e:
+            print(f"소통24 수집 오류: {e}")
+
+        browser.close()
+    return events
+
+# 3. 커뮤니티 보완 (뽐뿌 이벤트 게시판)
+def fetch_ppomppu():
     events = []
     url = "https://www.ppomppu.co.kr/zboard/zboard.php?id=event"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -69,63 +150,71 @@ def fetch_community_events():
         res = requests.get(url, headers=headers, timeout=10)
         res.encoding = "euc-kr"
         soup = BeautifulSoup(res.text, "html.parser")
-        rows = soup.select("tr.baseList")
-        for row in rows:
+        for row in soup.select("tr.baseList"):
             title_el = row.select_one("a.baseList-title")
             if not title_el:
                 continue
             title = title_el.get_text(strip=True)
             href = title_el.get("href", "")
-            link = f"https://www.ppomppu.co.kr/zboard/{href}"
-            
-            if is_target_event(title):
+            if is_valid_event(title, require_public=False):
                 events.append({
                     "id": f"ppomppu_{href.split('no=')[-1]}",
-                    "source": "이벤트게시판",
+                    "source": "뽐뿌이벤트",
                     "title": title,
-                    "link": link
+                    "link": f"https://www.ppomppu.co.kr/zboard/{href}"
                 })
     except Exception as e:
-        print(f"커뮤니티 수집 오류: {e}")
+        print(f"뽐뿌 수집 오류: {e}")
     return events
 
-def send_telegram_message(new_events):
+# 텔레그램 전송 (4,000자 초과 시 자동 분할 발송)
+def send_telegram_messages(new_events):
     if not BOT_TOKEN or not CHAT_ID:
-        print("텔레그램 환경변수가 설정되지 않았습니다.")
+        print("텔레그램 설정 누락")
+        return
+    if not new_events:
+        print("신규 이벤트 없음")
         return
 
     today_str = datetime.now().strftime("%Y-%m-%d")
-    if not new_events:
-        # 새로운 이벤트가 없을 때는 메시지를 안 보내거나 간단히 알림 (불필요한 알림 방지를 위해 생략 권장)
-        print("오늘 새로 수집된 타겟 이벤트가 없습니다.")
-        return
-
-    lines = [f"☕ <b>[{today_str}] 오늘의 설문·커피 이벤트 ({len(new_events)}건)</b>\n"]
+    header = f"☕ <b>[{today_str}] 공공기관·커피 설문 이벤트 ({len(new_events)}건)</b>\n\n"
+    
+    chunks = []
+    current_msg = header
     for idx, ev in enumerate(new_events, 1):
-        lines.append(f"{idx}. <b>[{ev['source']}]</b> {ev['title']}\n👉 <a href='{ev['link']}'>바로 응모하기</a>\n")
+        entry = f"{idx}. <b>[{ev['source']}]</b> {ev['title']}\n👉 <a href='{ev['link']}'>바로 응모하기</a>\n\n"
+        if len(current_msg) + len(entry) > 3800:
+            chunks.append(current_msg)
+            current_msg = entry
+        else:
+            current_msg += entry
+    chunks.append(current_msg)
 
-    message = "\n".join(lines)
     api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True
-    }
-    res = requests.post(api_url, json=payload)
-    print("텔레그램 전송 결과:", res.status_code)
+    for chunk in chunks:
+        payload = {
+            "chat_id": CHAT_ID,
+            "text": chunk,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": True
+        }
+        res = requests.post(api_url, json=payload)
+        print("텔레그램 전송 상태:", res.status_code)
 
 def main():
     history = load_history()
-    all_events = fetch_epeople_surveys() + fetch_community_events()
-    
+    collected = fetch_public_portals() + fetch_naver_api() + fetch_ppomppu()
+
+    # 이번 실행 내 중복 제거 + 과거 발송 이력 중복 제거
+    seen_ids = set(history)
     new_events = []
-    for ev in all_events:
-        if ev["id"] not in history:
+    for ev in collected:
+        if ev["id"] not in seen_ids:
+            seen_ids.add(ev["id"])
             new_events.append(ev)
             history.append(ev["id"])
 
-    send_telegram_message(new_events)
+    send_telegram_messages(new_events)
     save_history(history)
 
 if __name__ == "__main__":
