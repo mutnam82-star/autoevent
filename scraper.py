@@ -17,6 +17,7 @@ NAVER_CLIENT_SECRET = os.environ.get("NAVER_CLIENT_SECRET")
 
 HISTORY_FILE = "sent_history.json"
 EVENTS_DATA_FILE = "events_data.json"
+DASHBOARD_URL = "https://autoeventcollector.zinzerman01.workers.dev"
 
 # 키워드 필터 설정
 SURVEY_KEYWORDS = ["설문", "만족도", "의견수렴", "투표", "퀴즈", "이벤트"]
@@ -38,7 +39,7 @@ def save_history(history):
         json.dump(history[-1000:], f, ensure_ascii=False, indent=2)
 
 def update_events_json(new_events):
-    """웹 대시보드(index.html)용 events_data.json 업데이트"""
+    """웹 대시보드용 events_data.json 업데이트"""
     existing = []
     if os.path.exists(EVENTS_DATA_FILE):
         with open(EVENTS_DATA_FILE, "r", encoding="utf-8") as f:
@@ -187,7 +188,7 @@ def fetch_ppomppu():
         print(f"뽐뿌 수집 오류: {e}")
     return events
 
-# 텔레그램 전송 (4,000자 초과 시 자동 분할 발송)
+# 텔레그램 전송 (4,000자 초과 시 자동 분할 발송 + 하단 대시보드 버튼)
 def send_telegram_messages(new_events):
     if not BOT_TOKEN or not CHAT_ID:
         print("텔레그램 설정 누락")
@@ -211,13 +212,21 @@ def send_telegram_messages(new_events):
     chunks.append(current_msg)
 
     api_url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    for chunk in chunks:
+    for i, chunk in enumerate(chunks):
         payload = {
             "chat_id": CHAT_ID,
             "text": chunk,
             "parse_mode": "HTML",
             "disable_web_page_preview": True
         }
+        # 마지막 메시지 하단에 대시보드 바로가기 인라인 버튼 추가
+        if i == len(chunks) - 1 and DASHBOARD_URL:
+            payload["reply_markup"] = {
+                "inline_keyboard": [
+                    [{"text": "📊 대시보드 열기", "url": DASHBOARD_URL}]
+                ]
+            }
+
         res = requests.post(api_url, json=payload)
         print("텔레그램 전송 상태:", res.status_code)
 
