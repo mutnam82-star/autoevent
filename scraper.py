@@ -19,11 +19,17 @@ HISTORY_FILE = "sent_history.json"
 EVENTS_DATA_FILE = "events_data.json"
 DASHBOARD_URL = "https://autoeventcollector.zinzerman01.workers.dev"
 
-# 키워드 필터 설정
+# 연도 및 키워드 필터 설정
+CURRENT_YEAR = datetime.now(KST).year
+PAST_YEARS = [str(CURRENT_YEAR - 1), str(CURRENT_YEAR - 2)]
+
 SURVEY_KEYWORDS = ["설문", "만족도", "의견수렴", "투표", "퀴즈", "이벤트"]
 REWARD_KEYWORDS = ["커피", "아메리카노", "스타벅스", "기프티콘", "모바일상품권", "상품권", "쿠폰", "추첨", "경품", "음료"]
 PUBLIC_KEYWORDS = ["구청", "시청", "군청", "도청", "공사", "공단", "진흥원", "연구원", "교육청", "보건소", "센터", "재단", "협회", "정부", "지자체", "공공"]
-EXCLUDE_KEYWORDS = ["마감", "종료", "당첨자 발표", "당첨자발표", "후기", "리뷰"]
+EXCLUDE_KEYWORDS = [
+    "마감", "종료", "당첨자 발표", "당첨자발표", "후기", "리뷰",
+    "기자", "보도자료", "뉴스", "신문", "일보", "방송", "언론"
+] + PAST_YEARS
 
 def clean_html(text):
     return re.sub(r"<[^>]+>", "", text).replace("&quot;", '"').replace("&amp;", "&").strip()
@@ -64,7 +70,7 @@ def is_valid_event(text, require_public=False):
         return has_survey and has_reward and has_public
     return has_survey and has_reward
 
-# 1. 네이버 검색 API (블로그 + 웹문서: 전국 지자체·공기업 싹쓸이)
+# 1. 네이버 검색 API (블로그 최신순 + 최근 7일 이내 글만 필터링)
 def fetch_naver_api():
     if not NAVER_CLIENT_ID or not NAVER_CLIENT_SECRET:
         print("네이버 API 키가 설정되지 않았습니다.")
@@ -81,33 +87,37 @@ def fetch_naver_api():
         "지자체 설문 이벤트 스타벅스",
         "공단 설문조사 추첨 쿠폰"
     ]
-    endpoints = [
-        ("네이버블로그", "https://openapi.naver.com/v1/search/blog.json"),
-        ("네이버웹", "https://openapi.naver.com/v1/search/webkr.json")
-    ]
+    url = "https://openapi.naver.com/v1/search/blog.json"
+    today = datetime.now(KST).date()
 
-    for source_name, url in endpoints:
-        for q in queries:
-            params = {"query": q, "display": 15, "sort": "date"}
-            try:
-                res = requests.get(url, headers=headers, params=params, timeout=10)
-                if res.status_code != 200:
-                    continue
-                for item in res.json().get("items", []):
-                    title = clean_html(item.get("title", ""))
-                    desc = clean_html(item.get("description", ""))
-                    link = item.get("link", "")
-                    combined = f"{title} {desc}"
+    for q in queries:
+        params = {"query": q, "display": 20, "sort": "date"}
+        try:
+            res = requests.get(url, headers=headers, params=params, timeout=10)
+            if res.status_code != 200:
+                continue
+            for item in res.json().get("items", []):
+                # 작성일(YYYYMMDD) 체크: 최근 7일 이내 글만 통과
+                postdate_str = item.get("postdate", "")
+                if len(postdate_str) == 8:
+                    post_date = datetime.strptime(postdate_str, "%Y%m%d").date()
+                    if (today - post_date).days > 7:
+                        continue
 
-                    if is_valid_event(combined, require_public=True):
-                        events.append({
-                            "id": f"naver_{link}",
-                            "source": source_name,
-                            "title": title,
-                            "link": link
-                        })
-            except Exception as e:
-                print(f"네이버 API({source_name}, {q}) 오류: {e}")
+                title = clean_html(item.get("title", ""))
+                desc = clean_html(item.get("description", ""))
+                link = item.get("link", "")
+                combined = f"{title} {desc}"
+
+                if is_valid_event(combined, require_public=True):
+                    events.append({
+                        "id": f"naver_{link}",
+                        "source": "네이버블로그",
+                        "title": title,
+                        "link": link
+                    })
+        except Exception as e:
+            print(f"네이버 API({q}) 오류: {e}")
     return events
 
 # 2. 국민생각함 & 소통24 (Playwright 동적 렌더링 수집)
